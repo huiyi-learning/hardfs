@@ -8,3 +8,7 @@
 *.jar
 *.war
 *.ear
+*.tar.gz
+*.tar
+*.zip
+
