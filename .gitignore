@@ -1,0 +1,10 @@
+/hadoop-dist
+/.settings
+/.project
+/.classpath
+/.springBeans
+
+*.class
+*.jar
+*.war
+*.ear
