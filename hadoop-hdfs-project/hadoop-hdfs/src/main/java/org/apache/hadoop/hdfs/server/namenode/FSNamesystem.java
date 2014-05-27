@@ -2999,7 +2999,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
   
 
   /** Rename src to dst */
-  void renameTo(String src, String dst, Options.Rename... options)
+  public void renameTo(String src, String dst, Options.Rename... options)
       throws IOException, UnresolvedLinkException {
     if (NameNode.stateChangeLog.isDebugEnabled()) {
       NameNode.stateChangeLog.debug("DIR* NameSystem.renameTo: with options - "
@@ -3264,7 +3264,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
    *         or null if file not found
    * @throws StandbyException 
    */
-  HdfsFileStatus getFileInfo(String src, boolean resolveLink) 
+  public HdfsFileStatus getFileInfo(String src, boolean resolveLink) 
     throws AccessControlException, UnresolvedLinkException,
            StandbyException, IOException {
     if (!DFSUtil.isValidName(src)) {

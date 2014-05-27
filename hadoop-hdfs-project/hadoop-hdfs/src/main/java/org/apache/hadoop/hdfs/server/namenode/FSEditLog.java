@@ -506,7 +506,7 @@ public class FSEditLog implements LogsPurgeable {
    * NOTE: this should be done while holding the FSNamesystem lock, or
    * else more operations can start writing while this is in progress.
    */
-  void logSyncAll() {
+  public void logSyncAll() {
     // Record the most recent transaction ID as our own id
     synchronized (this) {
       TransactionId id = myTransactionId.get();

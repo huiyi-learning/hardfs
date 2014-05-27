@@ -30,6 +30,7 @@ import java.net.InetSocketAddress;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 
 import org.apache.commons.logging.Log;
@@ -96,6 +97,7 @@ import org.apache.hadoop.hdfs.server.namenode.NameNode;
 import org.apache.hadoop.hdfs.server.namenode.NameNode.OperationCategory;
 import org.apache.hadoop.hdfs.server.namenode.metrics.NameNodeMetrics;
 import org.apache.hadoop.hdfs.server.namenode.web.resources.NamenodeWebHdfsMethods;
+import org.apache.hadoop.hdfs.server.namenode.EditLogInputException;
 import org.apache.hadoop.hdfs.server.protocol.BlocksWithLocations;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeCommand;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeProtocol;
@@ -140,6 +142,9 @@ import org.apache.hadoop.util.VersionUtil;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.BlockingService;
 
+import edu.sjtu.StateManager;
+import org.apache.hadoop.hdfs.server.namenode.FSEditLogLoader;
+
 /**
  * This class is responsible for handling all of the RPC calls to the NameNode.
  * It is created, started, and stopped by {@link NameNode}.
@@ -150,6 +155,9 @@ class NameNodeRpcServer implements NamenodeProtocols {
   private static final Log stateChangeLog = NameNode.stateChangeLog;
   private static final Log blockStateChangeLog = NameNode.blockStateChangeLog;
   
+  // SLEEVE protection
+  private StateManager states = new StateManager();
+
   // Dependencies from other parts of NN.
   protected final FSNamesystem namesystem;
   protected final NameNode nn;
@@ -488,12 +496,75 @@ class NameNodeRpcServer implements NamenodeProtocols {
       throw new IOException("create: Pathname too long.  Limit "
           + MAX_PATH_LENGTH + " characters, " + MAX_PATH_DEPTH + " levels.");
     }
-    HdfsFileStatus fileStatus = namesystem.startFile(src, new PermissionStatus(
-        getRemoteUser().getShortUserName(), null, masked),
-        clientName, clientMachine, flag.get(), createParent, replication,
-        blockSize);
-    metrics.incrFilesCreated();
-    metrics.incrCreateFileOps();
+
+    // SLEEVE version
+    boolean exists = states.exists(src);
+    HdfsFileStatus fileStatus = namesystem.getFileInfo(src, false);
+
+    if (fileStatus != null) {
+      if (exists) {
+        // same behavior return as usual
+        throw new FileAlreadyExistsException();
+      } else {
+        // main version found, SLEEVE not found
+        try {
+          refreshNamesystem();
+        } catch (InterruptedException ie) {
+          LOG.info("Have a InterruptedException");
+        }
+        HdfsFileStatus fi = namesystem.getFileInfo(src, false);
+        if (fi != null) {
+          // file really exists
+          states.insert(src);
+          throw new FileAlreadyExistsException();
+        } else {
+          // file doesn't exist, create file.
+          namesystem.delete(src, false);
+          fileStatus = namesystem.startFile(src, new PermissionStatus(
+              getRemoteUser().getShortUserName(), null, masked),
+              clientName, clientMachine, flag.get(), createParent, replication,
+              blockSize);
+
+          states.insert(src);
+        }
+      }
+    } else {
+      if (exists) {
+        // main version not found, SLEEVE found
+        try {
+          refreshNamesystem();
+        } catch (InterruptedException ie) {
+          LOG.info("Have a InterruptedException");
+        }
+        HdfsFileStatus fi = namesystem.getFileInfo(src, false);
+        if (fi != null) {
+          // file really exists
+          fileStatus = namesystem.startFile(src, new PermissionStatus(
+            getRemoteUser().getShortUserName(), null, masked),
+            clientName, clientMachine, flag.get(), createParent, replication,
+            blockSize);
+          throw new FileAlreadyExistsException();
+        } else {
+          // file doesn't exist, create file.
+          namesystem.delete(src, false);
+          fileStatus = namesystem.startFile(src, new PermissionStatus(
+              getRemoteUser().getShortUserName(), null, masked),
+              clientName, clientMachine, flag.get(), createParent, replication,
+              blockSize);
+        }
+      } else {
+        // correct behavior, create file as usual
+        fileStatus = namesystem.startFile(src, new PermissionStatus(
+            getRemoteUser().getShortUserName(), null, masked),
+            clientName, clientMachine, flag.get(), createParent, replication,
+            blockSize);
+        metrics.incrFilesCreated();
+        metrics.incrCreateFileOps();
+
+        states.insert(src);
+      }
+    }
+
     return fileStatus;
   }
 
@@ -710,7 +781,55 @@ class NameNodeRpcServer implements NamenodeProtocols {
     return (src.length() <= MAX_PATH_LENGTH &&
             srcPath.depth() <= MAX_PATH_DEPTH);
   }
-    
+  
+  public void refreshNamesystem() throws IOException, InterruptedException {
+    namesystem.rollEditLog();
+
+    namesystem.writeLockInterruptibly();
+    try {
+      FSImage image = namesystem.getFSImage();
+      FSEditLog editLog = image.getEditLog();
+
+      long lastTxnId = image.getLastAppliedTxId();
+      
+      LOG.info("lastTxnId: " + lastTxnId);
+      
+      Collection<EditLogInputStream> streams;
+      try {
+        streams = editLog.selectInputStreams(lastTxnId + 1, 0, null, false);
+      } catch (IOException ioe) {
+        // This is acceptable. If we try to tail edits in the middle of an edits
+        // log roll, i.e. the last one has been finalized but the new inprogress
+        // edits file hasn't been started yet.
+        LOG.warn("Edits tailer failed to find any streams. Will try again " +
+            "later.", ioe);
+        return;
+      }
+
+      LOG.info("edit streams to load from: " + streams.size());
+      
+      // Once we have streams to load, errors encountered are legitimate cause
+      // for concern, so we don't catch them here. Simple errors reading from
+      // disk are ignored.
+      long editsLoaded = 0;
+      try {
+        editsLoaded = image.loadEdits(streams, namesystem, null);
+      } catch (EditLogInputException elie) {
+        editsLoaded = elie.getNumEditsLoaded();
+        throw elie;
+      } finally {
+        if (editsLoaded > 0 || LOG.isDebugEnabled()) {
+          LOG.info(String.format("Loaded %d edits starting from txid %d ",
+              editsLoaded, lastTxnId));
+        }
+      }
+
+    } finally {
+      namesystem.writeUnlock();
+    }
+
+  }
+
   @Override // ClientProtocol
   public boolean mkdirs(String src, FsPermission masked, boolean createParent)
       throws IOException {
@@ -721,9 +840,75 @@ class NameNodeRpcServer implements NamenodeProtocols {
       throw new IOException("mkdirs: Pathname too long.  Limit " 
                             + MAX_PATH_LENGTH + " characters, " + MAX_PATH_DEPTH + " levels.");
     }
-    return namesystem.mkdirs(src,
-        new PermissionStatus(getRemoteUser().getShortUserName(),
-            null, masked), createParent);
+
+    // SLEEVE version
+    boolean flag = false;
+    boolean exists = states.exists(src);
+    HdfsFileStatus fileStatus = namesystem.getFileInfo(src, false);
+
+    if (fileStatus != null) {
+      if (exists) {
+        // dir exists both in main version and SLEEVE
+        throw new IOException();
+      } else {
+        // main version found, SLEEVE not found
+        try {
+          refreshNamesystem();
+        } catch (InterruptedException ie) {
+          LOG.info("Have a InterruptedException");
+        }
+        HdfsFileStatus fi = namesystem.getFileInfo(src, false);
+        if (fi != null) {
+          // dir really exists
+          states.insert(src);
+          throw new IOException();
+        } else {
+          states.insert(src);
+
+          namesystem.delete(src, false);
+          flag = namesystem.mkdirs(src,
+            new PermissionStatus(getRemoteUser().getShortUserName(),
+                null, masked), createParent);
+        }
+      }
+    } else {
+      if (exists) {
+        // main version not found, SLEEVE found
+        try {
+          refreshNamesystem();
+        } catch (InterruptedException ie) {
+          LOG.info("Have a InterruptedException");
+        }
+        HdfsFileStatus fi = namesystem.getFileInfo(src, false);
+        if (fi != null) {
+          // main version is wrong, dir really exists
+          // fix this by recreate dir 
+          LOG.info("main version found, recreate dir.");
+          namesystem.mkdirs(src,
+            new PermissionStatus(getRemoteUser().getShortUserName(),
+                null, masked), createParent);
+
+          throw new IOException();
+        } else {
+          // main version is right, dir doesn't exist
+          // just create dir, no need to insert to bloom filter
+          // because it already exists in the bloom filter
+          LOG.info("dir doesn't exist. just create dir.");
+          flag = namesystem.mkdirs(src,
+            new PermissionStatus(getRemoteUser().getShortUserName(),
+                null, masked), createParent);
+        }
+      } else {
+        // correct behavior, execute command
+        states.insert(src);
+
+        flag = namesystem.mkdirs(src,
+            new PermissionStatus(getRemoteUser().getShortUserName(),
+                null, masked), createParent);
+      }
+    }
+
+    return flag;
   }
 
   @Override // ClientProtocol
